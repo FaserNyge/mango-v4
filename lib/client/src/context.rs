@@ -4,9 +4,10 @@ use anchor_client::ClientError;
 
 use anchor_lang::__private::bytemuck::{self, Zeroable};
 
+use mango_v4::accounts_zerocopy::KeyedAccountReader;
 use mango_v4::state::{
-    Bank, Group, MangoAccountValue, MintInfo, PerpMarket, PerpMarketIndex, Serum3Market,
-    Serum3MarketIndex, TokenIndex,
+    oracle_state_unchecked, Bank, Group, MangoAccountValue, MintInfo, PerpMarket, PerpMarketIndex,
+    Serum3Market, Serum3MarketIndex, TokenIndex,
 };
 
 use fixed::types::I80F48;
@@ -55,6 +56,12 @@ pub struct PerpMarketContext {
     pub address: Pubkey,
     /// PerpMarket snapshot is never updated, only use static parts!
     pub market: PerpMarket,
+}
+
+pub enum FallbackOracleContext {
+    None,
+    Fixed(Vec<Pubkey>),
+    AllAvailable,
 }
 
 pub struct ComputeEstimates {
@@ -121,6 +128,8 @@ pub struct MangoGroupContext {
     pub address_lookup_tables: Vec<Pubkey>,
 
     pub compute_estimates: ComputeEstimates,
+
+    pub fallback_oracle_context: FallbackOracleContext,
 }
 
 impl MangoGroupContext {
@@ -177,6 +186,14 @@ impl MangoGroupContext {
         );
         assert!(tc_iter.next().is_none(), "multiple token {name} found");
         tc.unwrap()
+    }
+
+    pub fn fallback_oracle_context(&self) -> &FallbackOracleContext {
+        &self.fallback_oracle_context
+    }
+
+    pub fn set_fallback_oracle_context(&mut self, new_ctx: FallbackOracleContext) {
+        self.fallback_oracle_context = new_ctx;
     }
 
     pub async fn new_from_rpc(rpc: &RpcClientAsync, group: Pubkey) -> anyhow::Result<Self> {
@@ -299,7 +316,25 @@ impl MangoGroupContext {
             perp_market_indexes_by_name,
             address_lookup_tables,
             compute_estimates: ComputeEstimates::default(),
+            fallback_oracle_context: FallbackOracleContext::None,
         })
+    }
+
+    fn derive_fallback_keys(&self, token_indices: impl Iterator<Item = u16>) -> Vec<Pubkey> {
+        match &self.fallback_oracle_context {
+            FallbackOracleContext::None => vec![],
+            FallbackOracleContext::Fixed(fallback_oracle_keys) => fallback_oracle_keys.clone(),
+            FallbackOracleContext::AllAvailable => {
+                let mut fallbacks = vec![];
+                for token_index in token_indices {
+                    let mint_info = self.mint_info(token_index);
+                    if mint_info.fallback_oracle != Pubkey::default() {
+                        fallbacks.push(mint_info.fallback_oracle);
+                    }
+                }
+                fallbacks
+            }
+        }
     }
 
     pub fn derive_health_check_remaining_account_metas(
@@ -324,6 +359,9 @@ impl MangoGroupContext {
         // figure out all the banks/oracles that need to be passed for the health check
         let mut banks = vec![];
         let mut oracles = vec![];
+        let token_indices = account.active_token_positions().map(|ta| ta.token_index);
+        let fallback_oracles = self.derive_fallback_keys(token_indices);
+
         for position in account.active_token_positions() {
             let mint_info = self.mint_info(position.token_index);
             banks.push((
@@ -358,6 +396,7 @@ impl MangoGroupContext {
             .chain(perp_markets.map(to_account_meta))
             .chain(perp_oracles.map(to_account_meta))
             .chain(serum_oos.map(to_account_meta))
+            .chain(fallback_oracles.into_iter().map(to_account_meta))
             .collect();
 
         let cu = self.compute_estimates.health_for_account(&account);
@@ -376,19 +415,22 @@ impl MangoGroupContext {
         let mut banks = vec![];
         let mut oracles = vec![];
 
-        let token_indexes = account2
+        let token_indexes: Vec<u16> = account2
             .active_token_positions()
             .chain(account1.active_token_positions())
             .map(|ta| ta.token_index)
             .chain(affected_tokens.iter().copied())
-            .unique();
+            .unique()
+            .collect();
 
-        for token_index in token_indexes {
-            let mint_info = self.mint_info(token_index);
+        for token_index in &token_indexes {
+            let mint_info = self.mint_info(*token_index);
             let writable_bank = writable_banks.iter().contains(&token_index);
             banks.push((mint_info.first_bank(), writable_bank));
             oracles.push(mint_info.oracle);
         }
+
+        let fallback_oracles = self.derive_fallback_keys(token_indexes.into_iter());
 
         let serum_oos = account2
             .active_serum3_orders()
@@ -424,6 +466,7 @@ impl MangoGroupContext {
             .chain(perp_markets.map(to_account_meta))
             .chain(perp_oracles.map(to_account_meta))
             .chain(serum_oos.map(to_account_meta))
+            .chain(fallback_oracles.into_iter().map(to_account_meta))
             .collect();
 
         // Since health is likely to be computed separately for both accounts, we don't use the
@@ -466,6 +509,35 @@ impl MangoGroupContext {
     pub async fn new_perp_markets_listed(&self, rpc: &RpcClientAsync) -> anyhow::Result<bool> {
         let new_perp_markets = fetch_perp_markets(rpc, mango_v4::id(), self.group).await?;
         Ok(new_perp_markets.len() > self.perp_markets.len())
+    }
+
+    pub async fn fetch_fallbacks_for_stale_oracles(
+        &self,
+        rpc: &RpcClientAsync,
+    ) -> anyhow::Result<Vec<Pubkey>> {
+        let banks_by_oracle: HashMap<Pubkey, Bank> = self
+            .tokens
+            .iter()
+            .map(|t| (t.1.bank.oracle, t.1.bank))
+            .collect();
+        let oracle_keys: Vec<Pubkey> = banks_by_oracle.values().map(|b| b.oracle).collect();
+        let oracle_accounts = fetch_multiple_accounts(rpc, &oracle_keys).await?;
+        let now_slot = rpc.get_slot().await?;
+        let mut fallbacks = vec![];
+        for acc in oracle_accounts {
+            let bank = banks_by_oracle.get(acc.key()).unwrap();
+            let state = oracle_state_unchecked(&acc, bank.mint_decimals)?;
+            if state
+                .check_confidence(bank.name(), &bank.oracle_config)
+                .is_err()
+                || state
+                    .check_staleness(bank.name(), &bank.oracle_config, now_slot)
+                    .is_err()
+            {
+                fallbacks.push(bank.fallback_oracle);
+            }
+        }
+        Ok(fallbacks)
     }
 }
 
