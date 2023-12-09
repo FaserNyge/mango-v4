@@ -1192,6 +1192,84 @@ pub mod mango_v4 {
         Ok(())
     }
 
+    #[derive(PartialEq, Copy, Clone, Debug, AnchorSerialize, AnchorDeserialize)]
+    pub struct MultiOrder {
+        // The price in lots (quote lots per base lots)
+        // - fill orders on the book up to this price or
+        // - place an order on the book at this price.
+        // - ignored for Market orders and potentially adjusted for PostOnlySlide orders.
+        price_lots: i64,
+
+        max_base_lots: i64,
+        max_quote_lots: i64,
+        client_order_id: u64,
+        order_type: PlaceOrderType,
+        self_trade_behavior: SelfTradeBehavior,
+        reduce_only: bool,
+
+        // Timestamp of when order expires
+        //
+        // Send 0 if you want the order to never expire.
+        // Timestamps in the past mean the instruction is skipped.
+        // Timestamps in the future are reduced to now + 65535s.
+        expiry_timestamp: u64,
+    }
+
+    // TODO FAS Orders
+    pub fn perp_cancel_replace_all_orders(
+        ctx: Context<PerpPlaceOrder>,
+        buy_orders: Vec<MultiOrder>,
+        sell_orders: Vec<MultiOrder>,
+        limit: u8
+    ) -> Result<()> {
+        #[cfg(feature = "enable-gpl")]
+        use crate::state::{Order, OrderParams};
+
+        let order_builder = | m_order: MultiOrder, side: Side | -> Result<Option<Order>> {
+            let time_in_force = match Order::tif_from_expiry(m_order.expiry_timestamp) {
+                Some(t) => t,
+                None => {
+                    msg!("Order is already expired");
+                    return Ok(None);
+                }
+            };
+
+            Ok(Some(Order {
+                side,
+                max_base_lots: m_order.max_base_lots,
+                max_quote_lots: m_order.max_quote_lots,
+                client_order_id: m_order.client_order_id,
+                reduce_only: m_order.reduce_only,
+                time_in_force: time_in_force,
+                self_trade_behavior: m_order.self_trade_behavior,
+                params: match m_order.order_type {
+                    PlaceOrderType::Market => OrderParams::Market {},
+                    PlaceOrderType::ImmediateOrCancel => OrderParams::ImmediateOrCancel {
+                        price_lots: m_order.price_lots
+                    },
+                    _ => OrderParams::Fixed {
+                        price_lots: m_order.price_lots,
+                        order_type: m_order.order_type.to_post_order_type()?,
+                    },
+                },
+            }))
+        };
+
+        let mut orders = Vec::new();
+        for buy_order in buy_orders.iter() {
+            if let Some(order) = order_builder(*buy_order, Side::Bid)? {
+                orders.push(order);
+            }
+        }
+        for sell_order in sell_orders.iter() {
+            if let Some(order) = order_builder(*sell_order, Side::Ask)? {
+                orders.push(order);
+            }
+        }
+        instructions::perp_cancel_replace_all_orders(ctx, orders, limit)?;
+        Ok(())
+    }
+
     pub fn perp_cancel_all_orders_by_side(
         ctx: Context<PerpCancelAllOrdersBySide>,
         side_option: Option<Side>,

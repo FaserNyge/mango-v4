@@ -1,9 +1,11 @@
+use std::cell::RefMut;
 use anchor_lang::prelude::*;
+use fixed::types::I80F48;
 
 use crate::accounts_ix::*;
 use crate::accounts_zerocopy::*;
 use crate::error::*;
-use crate::health::{new_fixed_order_account_retriever, new_health_cache};
+use crate::health::{HealthCache, new_fixed_order_account_retriever, new_health_cache};
 use crate::state::*;
 
 // TODO
@@ -23,21 +25,7 @@ pub fn perp_place_order(
     //
     // Doing this automatically here makes it impossible for attackers to add orders to the orderbook
     // before triggering the funding computation.
-    {
-        let mut perp_market = ctx.accounts.perp_market.load_mut()?;
-        let book = Orderbook {
-            bids: ctx.accounts.bids.load_mut()?,
-            asks: ctx.accounts.asks.load_mut()?,
-        };
-
-        let oracle_state = perp_market.oracle_state(
-            &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?,
-            None, // staleness checked in health
-        )?;
-        oracle_price = oracle_state.price;
-
-        perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
-    }
+    oracle_price = perp_place_order_update_funding(&ctx, now_ts)?;
 
     let mut account = ctx.accounts.account.load_full_mut()?;
     // account constraint #1
@@ -64,16 +52,7 @@ pub fn perp_place_order(
     //
     // Pre-health computation, _after_ perp position is created
     //
-    let pre_health_opt = if !account.fixed.is_in_health_region() {
-        let retriever =
-            new_fixed_order_account_retriever(ctx.remaining_accounts, &account.borrow())?;
-        let health_cache = new_health_cache(&account.borrow(), &retriever, now_ts)
-            .context("pre-withdraw init health")?;
-        let pre_init_health = account.check_health_pre(&health_cache)?;
-        Some((health_cache, pre_init_health))
-    } else {
-        None
-    };
+    let pre_health_opt = perp_place_order_pre_health_checks(&ctx, now_ts, &mut account)?;
 
     let mut perp_market = ctx.accounts.perp_market.load_mut()?;
     let mut book = Orderbook {
@@ -81,28 +60,15 @@ pub fn perp_place_order(
         asks: ctx.accounts.asks.load_mut()?,
     };
 
-    let mut event_queue = ctx.accounts.event_queue.load_mut()?;
-    let group = ctx.accounts.group.load()?;
 
     let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
-    account
-        .fixed
-        .expire_buyback_fees(now_ts, group.buyback_fees_expiry_interval);
+    perp_place_order_update_buyback_fees(&ctx, &mut account, now_ts)?;
 
     let pp = account.perp_position(perp_market_index)?;
     let effective_pos = pp.effective_base_position_lots();
-    let max_base_lots = if order.reduce_only || perp_market.is_reduce_only() {
-        reduce_only_max_base_lots(pp, &order, perp_market.is_reduce_only())
-    } else {
-        order.max_base_lots
-    };
-    if perp_market.is_reduce_only() {
-        require!(
-            order.reduce_only || max_base_lots == order.max_base_lots,
-            MangoError::MarketInReduceOnlyMode
-        )
-    };
-    order.max_base_lots = max_base_lots;
+    order.max_base_lots = compute_max_base_lots(&mut order, &mut perp_market, pp)?;
+
+    let mut event_queue = ctx.accounts.event_queue.load_mut()?;
 
     let order_id_opt = book.new_order(
         order,
@@ -118,13 +84,71 @@ pub fn perp_place_order(
     //
     // Health check
     //
+    post_place_order_health_check(&mut account, perp_market_index, pre_health_opt, &mut perp_market)?;
+
+    Ok(order_id_opt)
+}
+
+pub(crate) fn perp_place_order_update_buyback_fees(ctx: &Context<PerpPlaceOrder>, account: &mut MangoAccountLoadedRefCellMut, now_ts: u64) -> Result<()> {
+    let group = ctx.accounts.group.load()?;
+    account
+        .fixed
+        .expire_buyback_fees(now_ts, group.buyback_fees_expiry_interval);
+    Ok(())
+}
+
+pub(crate) fn post_place_order_health_check(account: &mut MangoAccountLoadedRefCellMut, perp_market_index: PerpMarketIndex, pre_health_opt: Option<(HealthCache, I80F48)>, perp_market: &mut RefMut<PerpMarket>) -> Result<()> {
     if let Some((mut health_cache, pre_init_health)) = pre_health_opt {
         let perp_position = account.perp_position(perp_market_index)?;
         health_cache.recompute_perp_info(perp_position, &perp_market)?;
         account.check_health_post(&health_cache, pre_init_health)?;
     }
+    Ok(())
+}
 
-    Ok(order_id_opt)
+pub(crate) fn compute_max_base_lots(order: &mut Order, mut perp_market: &mut RefMut<PerpMarket>, pp: &PerpPosition) -> Result<i64> {
+    let max_base_lots = if order.reduce_only || perp_market.is_reduce_only() {
+        reduce_only_max_base_lots(pp, &order, perp_market.is_reduce_only())
+    } else {
+        order.max_base_lots
+    };
+    if perp_market.is_reduce_only() {
+        require!(
+            order.reduce_only || max_base_lots == order.max_base_lots,
+            MangoError::MarketInReduceOnlyMode
+        )
+    };
+    Ok(max_base_lots)
+}
+
+pub(crate) fn perp_place_order_pre_health_checks(ctx: &Context<PerpPlaceOrder>, now_ts: u64, account: &mut MangoAccountLoadedRefCellMut) -> Result<Option<(HealthCache, I80F48)>> {
+    Ok(if !account.fixed.is_in_health_region() {
+        let retriever =
+            new_fixed_order_account_retriever(ctx.remaining_accounts, &account.borrow())?;
+        let health_cache = new_health_cache(&account.borrow(), &retriever, now_ts)
+            .context("pre-withdraw init health")?;
+        let pre_init_health = account.check_health_pre(&health_cache)?;
+        Some((health_cache, pre_init_health))
+    } else {
+        None
+    })
+}
+
+pub(crate) fn perp_place_order_update_funding(ctx: &Context<PerpPlaceOrder>, now_ts: u64) -> Result<I80F48> {
+    let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+
+    let book = Orderbook {
+        bids: ctx.accounts.bids.load_mut()?,
+        asks: ctx.accounts.asks.load_mut()?,
+    };
+
+    let oracle_state = perp_market.oracle_state(
+        &AccountInfoRef::borrow(ctx.accounts.oracle.as_ref())?,
+        None, // staleness checked in health
+    )?;
+
+    perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
+    Ok((oracle_state.price))
 }
 
 fn reduce_only_max_base_lots(pp: &PerpPosition, order: &Order, market_reduce_only: bool) -> i64 {
@@ -168,6 +192,7 @@ fn reduce_only_max_base_lots(pp: &PerpPosition, order: &Order, market_reduce_onl
 
 #[cfg(test)]
 mod tests {
+    use openbook_v2::openbook_v2::cancel_and_place_orders;
     use super::*;
 
     #[test]
@@ -217,5 +242,12 @@ mod tests {
             let result = reduce_only_max_base_lots(&pp, &order, market_reduce_only);
             assert_eq!(result, expected);
         }
+    }
+
+    #[test]
+    fn test_perp_cancel_all_and_replace(){
+        // TODO FAS
+
+        // cancel_and_place_orders()
     }
 }

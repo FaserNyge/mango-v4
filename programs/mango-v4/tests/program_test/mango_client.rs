@@ -4197,6 +4197,43 @@ impl ClientInstruction for PerpLiqNegativePnlOrBankruptcyInstruction {
     }
 }
 
+pub struct PerpCancelReplaceAllOrdersInstruction {
+    pub account: Pubkey,
+    pub perp_market: Pubkey,
+    pub owner: TestKeypair,
+    pub limit: u8,
+}
+#[async_trait::async_trait(?Send)]
+impl ClientInstruction for PerpCancelReplaceAllOrdersInstruction {
+    type Accounts = mango_v4::accounts::PerpCancelReplaceAllOrders;
+    type Instruction = mango_v4::instruction::PerpCancelReplaceAllOrders;
+    async fn to_instruction(
+        &self,
+        account_loader: impl ClientAccountLoader + 'async_trait,
+    ) -> (Self::Accounts, instruction::Instruction) {
+        // TODO FAS
+        let program_id = mango_v4::id();
+        let instruction = Self::Instruction { limit: self.limit };
+        let perp_market: PerpMarket = account_loader.load(&self.perp_market).await.unwrap();
+        let accounts = Self::Accounts {
+            group: perp_market.group,
+            account: self.account,
+            perp_market: self.perp_market,
+            bids: perp_market.bids,
+            asks: perp_market.asks,
+            owner: self.owner.pubkey(),
+        };
+
+        let instruction = make_instruction(program_id, &accounts, &instruction);
+        (accounts, instruction)
+    }
+
+    fn signers(&self) -> Vec<TestKeypair> {
+        vec![self.owner]
+    }
+}
+
+
 pub struct BenchmarkInstruction {}
 #[async_trait::async_trait(?Send)]
 impl ClientInstruction for BenchmarkInstruction {
