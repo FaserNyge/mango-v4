@@ -148,7 +148,7 @@ pub(crate) fn perp_place_order_update_funding(ctx: &Context<PerpPlaceOrder>, now
     )?;
 
     perp_market.update_funding_and_stable_price(&book, &oracle_state, now_ts)?;
-    Ok((oracle_state.price))
+    Ok(oracle_state.price)
 }
 
 fn reduce_only_max_base_lots(pp: &PerpPosition, order: &Order, market_reduce_only: bool) -> i64 {
@@ -192,7 +192,6 @@ fn reduce_only_max_base_lots(pp: &PerpPosition, order: &Order, market_reduce_onl
 
 #[cfg(test)]
 mod tests {
-    use openbook_v2::openbook_v2::cancel_and_place_orders;
     use super::*;
 
     #[test]
@@ -242,12 +241,5 @@ mod tests {
             let result = reduce_only_max_base_lots(&pp, &order, market_reduce_only);
             assert_eq!(result, expected);
         }
-    }
-
-    #[test]
-    fn test_perp_cancel_all_and_replace(){
-        // TODO FAS
-
-        // cancel_and_place_orders()
     }
 }

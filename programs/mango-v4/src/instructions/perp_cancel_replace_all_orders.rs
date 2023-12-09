@@ -23,17 +23,14 @@ pub fn perp_cancel_replace_all_orders(ctx: Context<PerpPlaceOrder>, // PerpCance
         MangoError::SomeError
     );
 
-    let mut perp_market = ctx.accounts.perp_market.load_mut()?;
-    let mut book = Orderbook {
-        bids: ctx.accounts.bids.load_mut()?,
-        asks: ctx.accounts.asks.load_mut()?,
-    };
 
     // Update funding if possible.
     //
     // Doing this automatically here makes it impossible for attackers to add orders to the orderbook
     // before triggering the funding computation.
     oracle_price = perp_place_order_update_funding(&ctx, now_ts)?;
+
+    msg!("Debug :: Funding updated");
 
     let account_pk = ctx.accounts.account.key();
     let (perp_market_index, settle_token_index) = {
@@ -44,10 +41,14 @@ pub fn perp_cancel_replace_all_orders(ctx: Context<PerpPlaceOrder>, // PerpCance
         )
     };
 
+    msg!("Debug :: Perp market index found");
+
     //
     // Create the perp position if needed
     //
     account.ensure_perp_position(perp_market_index, settle_token_index)?;
+
+    msg!("Debug :: Perp position created/already exists");
 
     //
     // Pre-health computation, _after_ perp position is created
@@ -57,10 +58,22 @@ pub fn perp_cancel_replace_all_orders(ctx: Context<PerpPlaceOrder>, // PerpCance
     let now_ts: u64 = Clock::get()?.unix_timestamp.try_into().unwrap();
     perp_place_order_update_buyback_fees(&ctx, &mut account, now_ts)?;
 
+    msg!("Debug :: Pre health checks OK");
+
+    let mut perp_market = ctx.accounts.perp_market.load_mut()?;
+    let mut book = Orderbook {
+        bids: ctx.accounts.bids.load_mut()?,
+        asks: ctx.accounts.asks.load_mut()?,
+    };
+
+    msg!("Debug :: Loaded account");
+
     //
     // Cancel existing orders
     //
     book.cancel_all_orders(&mut account.borrow_mut(), &mut perp_market, limit, None)?;
+
+    msg!("Debug :: Canceled orders");
 
     //
     // Place new orders
@@ -88,6 +101,8 @@ pub fn perp_cancel_replace_all_orders(ctx: Context<PerpPlaceOrder>, // PerpCance
         
         result_order_ids.push(order_id_opt);
     }
+
+    msg!("Debug :: Placed new orders");
 
     //
     // Health check

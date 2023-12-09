@@ -1474,22 +1474,11 @@ async fn test_perp_cancel_all_and_replace() -> Result<(), TransportError> {
         0,
     )
         .await;
-    let account_1 = create_funded_account(
-        &solana,
-        group,
-        owner,
-        1,
-        &context.users[1],
-        mints,
-        deposit_amount,
-        0,
-    )
-        .await;
 
     //
     // TEST: Create a perp market
     //
-    let mango_v4::accounts::PerpCreateMarket { perp_market, .. } = send_tx(
+    let mango_v4::accounts::PerpCreateMarket { perp_market, bids, asks, .. } = send_tx(
         solana,
         PerpCreateMarketInstruction {
             group,
@@ -1518,147 +1507,88 @@ async fn test_perp_cancel_all_and_replace() -> Result<(), TransportError> {
     set_perp_stub_oracle_price(solana, group, perp_market, &tokens[1], admin, 1000.0).await;
 
     //
-    // TEST: check compute per order match
+    // Helpers functions
     //
-
-    for limit in 1..6 {
-        for bid in price_lots..price_lots + 6 {
-            send_tx(
-                solana,
-                PerpPlaceOrderInstruction {
-                    account: account_0,
-                    perp_market,
-                    owner,
-                    side: Side::Bid,
-                    price_lots: bid,
-                    max_base_lots: 1,
-                    client_order_id: 5,
-                    ..PerpPlaceOrderInstruction::default()
-                },
-            )
-                .await
-                .unwrap();
-        }
-        let result = send_tx_get_metadata(
+    let place_order = | side: Side, price: i64 | {
+        send_tx(
             solana,
             PerpPlaceOrderInstruction {
-                account: account_1,
+                account: account_0,
                 perp_market,
                 owner,
-                side: Side::Ask,
-                price_lots,
-                max_base_lots: 10,
-                client_order_id: 6,
-                limit,
+                side,
+                price_lots: price,
+                max_base_lots: 1,
+                client_order_id: 5,
                 ..PerpPlaceOrderInstruction::default()
             },
         )
-            .await
-            .unwrap();
-        println!(
-            "CU for perp_place_order matching {limit} orders in sequence: {}",
-            result.metadata.unwrap().compute_units_consumed
-        );
+    };
 
-        send_tx(
-            solana,
-            PerpCancelAllOrdersInstruction {
-                account: account_0,
-                perp_market,
-                owner,
-                limit: 10,
-            },
-        )
-            .await
-            .unwrap();
-        send_tx(
-            solana,
-            PerpCancelAllOrdersInstruction {
-                account: account_1,
-                perp_market,
-                owner,
-                limit: 10,
-            },
-        )
-            .await
-            .unwrap();
-
-        send_tx(
-            solana,
-            PerpConsumeEventsInstruction {
-                perp_market,
-                mango_accounts: vec![account_0, account_1],
-            },
-        )
-            .await
-            .unwrap();
-        send_tx(
-            solana,
-            PerpConsumeEventsInstruction {
-                perp_market,
-                mango_accounts: vec![account_0, account_1],
-            },
-        )
-            .await
-            .unwrap();
-        send_tx(
-            solana,
-            PerpConsumeEventsInstruction {
-                perp_market,
-                mango_accounts: vec![account_0, account_1],
-            },
-        )
-            .await
-            .unwrap();
-    }
-
-    //
-    // TEST: check compute per order cancel
-    //
-
-    for count in 1..6 {
-        for bid in price_lots..price_lots + count {
-            send_tx(
-                solana,
-                PerpPlaceOrderInstruction {
-                    account: account_0,
-                    perp_market,
-                    owner,
-                    side: Side::Bid,
-                    price_lots: bid,
-                    max_base_lots: 1,
-                    client_order_id: 5,
-                    ..PerpPlaceOrderInstruction::default()
-                },
-            )
-                .await
-                .unwrap();
+    let generate_order_for_replace_all = | price: i64 | {
+        mango_v4::mango_v4::MultiOrder {
+            price_lots: price,
+            max_base_lots: 1,
+            max_quote_lots: 1,
+            client_order_id: 5,
+            order_type: PlaceOrderType::Limit,
+            self_trade_behavior: SelfTradeBehavior::AbortTransaction,
+            reduce_only: false,
+            expiry_timestamp: 0,
         }
-        let result = send_tx_get_metadata(
-            solana,
-            PerpCancelAllOrdersInstruction {
-                account: account_0,
-                perp_market,
-                owner,
-                limit: 10,
-            },
-        )
-            .await
-            .unwrap();
-        println!(
-            "CU for perp_cancel_all_orders matching {count} orders: {}",
-            result.metadata.unwrap().compute_units_consumed
-        );
+    };
 
-        send_tx(
-            solana,
-            PerpConsumeEventsInstruction {
-                perp_market,
-                mango_accounts: vec![account_0],
-            },
-        )
-            .await
-            .unwrap();
+    //
+    // Place some initial orders
+    //
+    place_order(Side::Bid, price_lots).await.unwrap();
+    place_order(Side::Bid, price_lots + 1).await.unwrap();
+    place_order(Side::Bid, price_lots + 2).await.unwrap();
+
+    //
+    // Cancel replace all
+    //
+    let mut bid_orders = Vec::new();
+    bid_orders.push(generate_order_for_replace_all(price_lots-12));
+    bid_orders.push(generate_order_for_replace_all(price_lots-10));
+    let mut ask_orders = Vec::new();
+    ask_orders.push(generate_order_for_replace_all(price_lots+10));
+    ask_orders.push(generate_order_for_replace_all(price_lots+12));
+
+    send_tx(
+        solana,
+        PerpCancelReplaceAllOrdersInstruction {
+            account: account_0,
+            perp_market,
+            owner,
+            bid_orders: bid_orders,
+            ask_orders: ask_orders,
+            limit: 10,
+        },
+    )
+        .await
+        .unwrap();
+
+    //
+    // TEST: check orders matches the one provided to PerpCancelReplaceAllOrdersInstruction
+    //
+    let mango_account_0 = solana.get_account::<MangoAccount>(account_0).await;
+    let bids_data = solana.get_account_boxed::<BookSide>(bids).await;
+    let asks_data = solana.get_account_boxed::<BookSide>(asks).await;
+
+    for oo in mango_account_0.perp_open_orders.iter() {
+        println!("Order id {}; market {}, client_id {}, side_and_tree {}",
+                 oo.id,
+                 oo.market,
+                 oo.client_id,
+                 oo.side_and_tree
+        );
+    }
+    for node in bids_data.roots {
+        println!("Bids leaf count {}", node.leaf_count);
+    }
+    for node in asks_data.roots {
+        println!("Asks leaf count {}", node.leaf_count);
     }
 
     Ok(())

@@ -1198,21 +1198,21 @@ pub mod mango_v4 {
         // - fill orders on the book up to this price or
         // - place an order on the book at this price.
         // - ignored for Market orders and potentially adjusted for PostOnlySlide orders.
-        price_lots: i64,
+        pub price_lots: i64,
 
-        max_base_lots: i64,
-        max_quote_lots: i64,
-        client_order_id: u64,
-        order_type: PlaceOrderType,
-        self_trade_behavior: SelfTradeBehavior,
-        reduce_only: bool,
+        pub max_base_lots: i64,
+        pub max_quote_lots: i64,
+        pub client_order_id: u64,
+        pub order_type: PlaceOrderType,
+        pub self_trade_behavior: SelfTradeBehavior,
+        pub reduce_only: bool,
 
         // Timestamp of when order expires
         //
         // Send 0 if you want the order to never expire.
         // Timestamps in the past mean the instruction is skipped.
         // Timestamps in the future are reduced to now + 65535s.
-        expiry_timestamp: u64,
+        pub expiry_timestamp: u64,
     }
 
     // TODO FAS Orders
@@ -1266,6 +1266,7 @@ pub mod mango_v4 {
                 orders.push(order);
             }
         }
+
         instructions::perp_cancel_replace_all_orders(ctx, orders, limit)?;
         Ok(())
     }

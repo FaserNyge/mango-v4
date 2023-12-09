@@ -4197,23 +4197,29 @@ impl ClientInstruction for PerpLiqNegativePnlOrBankruptcyInstruction {
     }
 }
 
+// TODO FAS
 pub struct PerpCancelReplaceAllOrdersInstruction {
     pub account: Pubkey,
     pub perp_market: Pubkey,
     pub owner: TestKeypair,
     pub limit: u8,
+    pub bid_orders: Vec<mango_v4::mango_v4::MultiOrder>,
+    pub ask_orders: Vec<mango_v4::mango_v4::MultiOrder>,
 }
 #[async_trait::async_trait(?Send)]
 impl ClientInstruction for PerpCancelReplaceAllOrdersInstruction {
-    type Accounts = mango_v4::accounts::PerpCancelReplaceAllOrders;
+    type Accounts = mango_v4::accounts::PerpPlaceOrder;
     type Instruction = mango_v4::instruction::PerpCancelReplaceAllOrders;
     async fn to_instruction(
         &self,
         account_loader: impl ClientAccountLoader + 'async_trait,
     ) -> (Self::Accounts, instruction::Instruction) {
-        // TODO FAS
         let program_id = mango_v4::id();
-        let instruction = Self::Instruction { limit: self.limit };
+        let instruction = Self::Instruction {
+            buy_orders: self.bid_orders.clone(),
+            sell_orders: self.ask_orders.clone(),
+            limit: self.limit
+        };
         let perp_market: PerpMarket = account_loader.load(&self.perp_market).await.unwrap();
         let accounts = Self::Accounts {
             group: perp_market.group,
@@ -4221,6 +4227,8 @@ impl ClientInstruction for PerpCancelReplaceAllOrdersInstruction {
             perp_market: self.perp_market,
             bids: perp_market.bids,
             asks: perp_market.asks,
+            event_queue: perp_market.event_queue,
+            oracle: perp_market.oracle,
             owner: self.owner.pubkey(),
         };
 
