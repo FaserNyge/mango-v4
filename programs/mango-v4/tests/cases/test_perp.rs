@@ -1441,7 +1441,10 @@ async fn test_perp_compute() -> Result<(), TransportError> {
 
 #[tokio::test]
 async fn test_perp_cancel_all_and_replace() -> Result<(), TransportError> {
-    let context = TestContext::new().await;
+    let mut test_builder = TestContextBuilder::new();
+    test_builder.test().set_compute_max_units(105_000);
+
+    let context = test_builder.start_default().await;
     let solana = &context.solana.clone();
 
     let admin = TestKeypair::new();
@@ -1529,7 +1532,7 @@ async fn test_perp_cancel_all_and_replace() -> Result<(), TransportError> {
         mango_v4::mango_v4::MultiOrder {
             price_lots: price,
             max_base_lots: 1,
-            max_quote_lots: 1,
+            max_quote_lots: i64::MAX,
             client_order_id: 5,
             order_type: PlaceOrderType::Limit,
             self_trade_behavior: SelfTradeBehavior::AbortTransaction,
@@ -1546,7 +1549,7 @@ async fn test_perp_cancel_all_and_replace() -> Result<(), TransportError> {
     place_order(Side::Bid, price_lots + 2).await.unwrap();
 
     //
-    // Cancel replace all
+    // ACT: Cancel replace all
     //
     let mut bid_orders = Vec::new();
     bid_orders.push(generate_order_for_replace_all(price_lots-12));
@@ -1576,20 +1579,65 @@ async fn test_perp_cancel_all_and_replace() -> Result<(), TransportError> {
     let bids_data = solana.get_account_boxed::<BookSide>(bids).await;
     let asks_data = solana.get_account_boxed::<BookSide>(asks).await;
 
+    println!("Test Cancel Replace ALL");
+
+    #[derive(Debug, PartialEq)]
+    struct ResultingLimit {
+        side: Side,
+        price: i64,
+        quantity: i64
+    };
+    let mut resulting_limits = Vec::new();
+
+    let now_ts: u64 = 0;
+
     for oo in mango_account_0.perp_open_orders.iter() {
-        println!("Order id {}; market {}, client_id {}, side_and_tree {}",
-                 oo.id,
-                 oo.market,
-                 oo.client_id,
-                 oo.side_and_tree
+        if oo.market == FREE_ORDER_SLOT {
+            continue;
+        }
+
+        let (price, quantity) = {
+            let mut matching_node  = Option::None;
+            for node in bids_data.iter_valid(now_ts, price_lots).chain(asks_data.iter_valid(now_ts, price_lots)) {
+                if node.node.key == oo.id {
+                    matching_node = Some(node);
+                    break;
+                }
+            };
+
+            match matching_node {
+                Some(node) => (node.price_lots, node.node.quantity),
+                _ => (0, 0)
+            }
+        };
+
+        let limit = ResultingLimit {
+            side: if oo.side_and_tree == 0 {
+                Side::Bid
+            } else {
+                Side::Ask
+            },
+            price,
+            quantity,
+        };
+
+        println!("Limit Side={} {}@{}",
+             match limit.side {
+                 Side::Ask => "Ask",
+                 Side::Bid => "Bid"
+             },
+             limit.quantity,
+             limit.price
         );
+
+        resulting_limits.push(limit);
     }
-    for node in bids_data.roots {
-        println!("Bids leaf count {}", node.leaf_count);
-    }
-    for node in asks_data.roots {
-        println!("Asks leaf count {}", node.leaf_count);
-    }
+
+    assert_eq!(resulting_limits.len(), 4);
+    assert_eq!(resulting_limits[0], ResultingLimit{ side: Side::Bid, price: 9988, quantity: 1 });
+    assert_eq!(resulting_limits[1], ResultingLimit{ side: Side::Bid, price: 9990, quantity: 1 });
+    assert_eq!(resulting_limits[2], ResultingLimit{ side: Side::Ask, price: 10010, quantity: 1 });
+    assert_eq!(resulting_limits[3], ResultingLimit{ side: Side::Ask, price: 10012, quantity: 1 });
 
     Ok(())
 }
