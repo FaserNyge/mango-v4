@@ -4220,7 +4220,21 @@ impl ClientInstruction for PerpCancelReplaceAllOrdersInstruction {
             sell_orders: self.ask_orders.clone(),
             limit: self.limit
         };
+
         let perp_market: PerpMarket = account_loader.load(&self.perp_market).await.unwrap();
+        let account = account_loader
+            .load_mango_account(&self.account)
+            .await
+            .unwrap();
+        let health_check_metas = derive_health_check_remaining_account_metas(
+            &account_loader,
+            &account,
+            None,
+            false,
+            Some(perp_market.perp_market_index),
+        )
+            .await;
+
         let accounts = Self::Accounts {
             group: perp_market.group,
             account: self.account,
@@ -4232,7 +4246,9 @@ impl ClientInstruction for PerpCancelReplaceAllOrdersInstruction {
             owner: self.owner.pubkey(),
         };
 
-        let instruction = make_instruction(program_id, &accounts, &instruction);
+        let mut instruction = make_instruction(program_id, &accounts, &instruction);
+        instruction.accounts.extend(health_check_metas);
+
         (accounts, instruction)
     }
 
